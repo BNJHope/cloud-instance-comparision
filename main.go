@@ -14,7 +14,7 @@
 
 package main
 
-import "cloud-instance-comparision/cmd"
+import "github.com/bnjhope/cloud-instance-comparision/cmd"
 
 func main() {
 	cmd.Execute()
