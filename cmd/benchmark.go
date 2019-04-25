@@ -33,6 +33,14 @@ func init() {
 	rootCmd.AddCommand(macroBenchCmd)
 }
 
+func benchmark(containerLink string, iterations int) {
+
+	for i := 0; i < iterations; i++ {
+
+	}
+
+}
+
 func runMacroBenchmarks() {
 	var (
 		cmd *exec.Cmd
