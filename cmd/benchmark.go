@@ -1,27 +1,29 @@
 package cmd
 
 import (
+	"errors"
 	"github.com/spf13/cobra"
 	"log"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // macroBenchCmd represents the router command
 var macroBenchCmd = &cobra.Command{
-	Use:   "macro-bench",
-	Short: "Start macro benchmarks",
-	Long: `Starts the macro benchmarks, involving run the benchmark
-	on the set of all instances to be benchmarked.`,
+	Use:   "bench-deploy",
+	Short: "Benchmark and deploy the given image",
+	Long: `Test the given image on containers with
+	different attributes and deploy the image to the best performing one.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		runMacroBenchmarks()
+		runBenchDeploy()
 	},
 }
 
-// macroBenchCmd represents the router command
+// testInstanceCmd test command for deploying an instance
 var testInstanceCmd = &cobra.Command{
 	Use:   "test-instance",
 	Short: "Start test instance",
@@ -43,7 +45,6 @@ const (
 	gcloudClusterArg   = "clusters"
 	machineTypeFlag    = "--machine-type"
 	quietFlag          = "--quiet"
-	defaultMem         = 12288
 )
 
 func init() {
@@ -61,6 +62,7 @@ func testInstance() {
 		//cmd         *exec.Cmd
 		fullPodName string
 		cpuAvg      float64
+		memAvg      float64
 	)
 
 	//	machineType := constructCustomMachineType(2)
@@ -75,7 +77,7 @@ func testInstance() {
 	//	}
 	//	cmd.Wait()
 	//
-	if fullPodName, err = getFullPodsName(); err != nil {
+	if fullPodName, err = getFullPodsName(0); err != nil {
 		log.Fatal(err)
 	}
 
@@ -83,84 +85,147 @@ func testInstance() {
 	log.Println("waiting 3 mins to get CPU avg")
 	log.Println("getting cpu avg")
 
-	if cpuAvg, err = getCpuAvg(fullPodName); err != nil {
+	if cpuAvg, memAvg, err = getTopAvg(fullPodName); err != nil {
 		log.Fatal(err)
 	}
 
 	log.Println(cpuAvg)
+	log.Println(memAvg)
 }
 
-func runMacroBenchmarks() {
+func runBenchDeploy() {
 	var (
-		score     float64
-		bestScore float64 = 0
-		bestCores int     = 0
-		err       error
-		cmd       *exec.Cmd
+		bestScore     float64
+		err           error
+		bestResult    *result
+		cmd           *exec.Cmd
+		endGroup      sync.WaitGroup
+		instanceMutex = &sync.Mutex{}
 	)
 
-	for i := 0; i < numOfIterations; i++ {
-		score = runMicroBenchmark(4)
-		if score > bestScore {
-			bestScore = score
-			bestCores = 4
+	log.Println("Starting benchdeploy")
+	instancesToTry := getDefaultInstanceConfigsChan()
+	log.Println("Instances fetched")
+	resultsChan := make(chan *result, MaxContainerCreators+1)
+	endGroup.Add(MaxContainerCreators)
+
+	log.Println("Resources created")
+	for i := 0; i < MaxContainerCreators; i++ {
+		go startClusterCreator(i,
+			instancesToTry,
+			resultsChan,
+			&endGroup,
+			instanceMutex)
+	}
+
+	log.Println("workers created")
+
+	endGroup.Wait()
+	log.Println("endgroup finished")
+	close(instancesToTry)
+
+	for res := range resultsChan {
+		if res.score > bestScore {
+			bestResult = res
 		}
 	}
 
-	log.Printf("Best cores: %d\n", bestCores)
+	log.Println("best score selected")
+	close(resultsChan)
+
+	log.Printf("Best cores: %d\n", bestResult.inst.cores)
+	log.Printf("Best mem: %d\n", bestResult.inst.mem)
 	log.Printf("Starting instance for image with best containers.")
 
-	machineType := constructCustomMachineType(bestCores)
+	machineType := bestResult.inst.constructCustomMachineType()
 
 	if cmd, err = startCluster("test-cluster", machineType); err != nil {
 		log.Fatal(err)
 	}
 	cmd.Wait()
 
+	log.Println("starting pod selected")
 	if cmd, err = createPod("test-pod", imageLink); err != nil {
 		log.Fatal(err)
 	}
 	cmd.Wait()
 }
 
-func runMicroBenchmark(cores int) float64 {
+func startClusterCreator(workerIndex int, instances chan (*instance), resultChan chan (*result), endGroup *sync.WaitGroup, instanceMutex *sync.Mutex) {
+	defer endGroup.Done()
+	var (
+		instanceToCheck *instance
+		score           float64
+		bestScore       float64
+		bestResult      *result
+	)
+
+	for len(instances) > 0 {
+		instanceMutex.Lock()
+		instanceToCheck = <-instances
+		instanceMutex.Unlock()
+		log.Printf("Worker %d checking instance %d %d\n",
+			workerIndex,
+			instanceToCheck.cores,
+			instanceToCheck.mem)
+		score = runMicroBenchmark(workerIndex, instanceToCheck)
+		log.Printf("Score %f from worker %d\n",
+			score,
+			workerIndex)
+		if score > bestScore {
+			bestResult = &result{score, instanceToCheck}
+		}
+	}
+	resultChan <- bestResult
+	log.Printf("Worker %d finished\n", workerIndex)
+}
+
+func runMicroBenchmark(workerIndex int, inst *instance) float64 {
 	var (
 		cmd         *exec.Cmd
 		err         error
 		cpuAvg      float64
+		memAvg      float64
 		fullPodName string
 	)
 
-	machineType := constructCustomMachineType(cores)
+	machineType := inst.constructCustomMachineType()
+	machineName := constructMachineName(workerIndex)
+	podName := constructPodName(workerIndex)
 
-	if cmd, err = startCluster("test-cluster", machineType); err != nil {
+	log.Printf("Worker %d starting cluster\n", workerIndex)
+	if cmd, err = startCluster(machineName, machineType); err != nil {
 		log.Fatal(err)
 	}
 	cmd.Wait()
 
-	if cmd, err = createPod("test-pod", imageLink); err != nil {
+	log.Printf("Worker %d starting pod\n", workerIndex)
+	if cmd, err = createPod(podName, imageLink); err != nil {
 		log.Fatal(err)
 	}
 	cmd.Wait()
 
-	if fullPodName, err = getFullPodsName(); err != nil {
+	if fullPodName, err = getFullPodsName(workerIndex); err != nil {
 		log.Fatal(err)
 	}
 	cmd.Wait()
 
-	time.Sleep(5 * time.Minute)
+	log.Printf("Worker %d sleeping\n", workerIndex)
+	time.Sleep(3 * time.Minute)
 
-	if cpuAvg, err = getCpuAvg(fullPodName); err != nil {
+	log.Printf("Worker %d get avg\n", workerIndex)
+	if cpuAvg, memAvg, err = getTopAvg(fullPodName); err != nil {
 		log.Fatal(err)
 	}
 
+	log.Printf("Worker %d stopping cluster\n", workerIndex)
 	if cmd, err = stopCluster("test-cluster"); err != nil {
 		log.Fatal(err)
 	}
 
 	cmd.Wait()
 
-	return calculateScore(cpuAvg, 30, cores)
+	return calculateScore(cpuAvg, memAvg, 30, inst)
 }
 
 func startCluster(clusterName string, machineType string) (*exec.Cmd, error) {
@@ -169,7 +234,8 @@ func startCluster(clusterName string, machineType string) (*exec.Cmd, error) {
 		gcloudClusterArg,
 		"create",
 		clusterName,
-		getMachineTypeFlag(machineType))
+		getMachineTypeFlag(machineType),
+		"--num-nodes=1")
 	cmd.Stdout = os.Stdout
 	if err := cmd.Start(); err != nil {
 		return nil, err
@@ -199,16 +265,21 @@ func getMachineTypeFlag(machineType string) string {
 	return sb.String()
 }
 
-func constructCustomMachineType(cores int) string {
+func constructMachineName(workerIndex int) string {
 	var sb strings.Builder
-	sb.WriteString("custom-")
-	sb.WriteString(strconv.Itoa(cores))
-	sb.WriteString("-")
-	sb.WriteString(strconv.Itoa(defaultMem))
+	sb.WriteString("cluster")
+	sb.WriteString(strconv.Itoa(workerIndex))
 	return sb.String()
 }
 
-func getCpuAvg(podName string) (float64, error) {
+func constructPodName(workerIndex int) string {
+	var sb strings.Builder
+	sb.WriteString("pod")
+	sb.WriteString(strconv.Itoa(workerIndex))
+	return sb.String()
+}
+
+func getTopAvg(podName string) (float64, float64, error) {
 	var (
 		output []byte
 		err    error
@@ -218,13 +289,14 @@ func getCpuAvg(podName string) (float64, error) {
 		"top",
 		"pod",
 		podName).Output(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return parseCpuAvg(output)
+
+	return parseTopMetrics(output)
 }
 
-func calculateScore(cpuAvg float64, price float64, numOfCores int) float64 {
-	return cpuAvg * float64(numOfCores) / price
+func calculateScore(cpuAvg float64, memAvg float64, price float64, inst *instance) float64 {
+	return cpuAvg * memAvg * float64(inst.cores) * float64(inst.mem) / price
 }
 
 func createPod(podName string, imageName string) (*exec.Cmd, error) {
@@ -234,6 +306,7 @@ func createPod(podName string, imageName string) (*exec.Cmd, error) {
 		podName,
 		getImageFlag(imageName))
 	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
@@ -241,7 +314,7 @@ func createPod(podName string, imageName string) (*exec.Cmd, error) {
 
 }
 
-func getFullPodsName() (string, error) {
+func getFullPodsName(workerIndex int) (string, error) {
 	var (
 		output []byte
 		err    error
@@ -253,7 +326,7 @@ func getFullPodsName() (string, error) {
 		return "", err
 	}
 
-	return parseFullPodName(output)
+	return parseFullPodName(workerIndex, output)
 }
 
 func getImageFlag(imageName string) string {
@@ -263,26 +336,42 @@ func getImageFlag(imageName string) string {
 	return sb.String()
 }
 
-func parseCpuAvg(output []byte) (float64, error) {
+func parseTopMetrics(output []byte) (float64, float64, error) {
 	var (
-		avg float64
+		cpu float64
+		mem float64
 		err error
 	)
 	outputStr := string(output)
 	lines := strings.Split(outputStr, "\n")
 	avgline := lines[1]
-	avgString := strings.Fields(avgline)[1]
-	avgStringWithoutUnit := strings.TrimSuffix(avgString, "m")
-	if avg, err = strconv.ParseFloat(avgStringWithoutUnit, 64); err != nil {
-		return 0, err
+	cpuString := strings.Fields(avgline)[1]
+	memString := strings.Fields(avgline)[2]
+	cpuStringWithoutUnit := strings.TrimSuffix(cpuString, "m")
+	memStringWithoutUnit := strings.TrimSuffix(memString, "%")
+	if cpu, err = strconv.ParseFloat(cpuStringWithoutUnit, 64); err != nil {
+		return 0, 0, err
 	}
-	return avg, nil
+	if mem, err = strconv.ParseFloat(memStringWithoutUnit, 64); err != nil {
+		return 0, 0, err
+	}
+	return cpu, mem, nil
 }
 
-func parseFullPodName(output []byte) (string, error) {
+func parseFullPodName(workerIndex int, output []byte) (string, error) {
+	var (
+		podName string
+	)
 	outputStr := string(output)
 	lines := strings.Split(outputStr, "\n")
-	nameline := lines[1]
-	podName := strings.Fields(nameline)[0]
-	return podName, nil
+	log.Printf("Printing output for worker %d\n", workerIndex)
+	log.Println(outputStr)
+	for _, l := range lines[1:len(lines)] {
+		name := strings.Fields(l)[0]
+		if strings.Contains(name, constructPodName(workerIndex)) {
+			return podName, nil
+		}
+	}
+
+	return "", errors.New("pod not found")
 }
