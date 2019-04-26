@@ -13,7 +13,7 @@ type instance struct {
 
 type result struct {
 	score float64
-	inst  *instance
+	inst  instance
 }
 
 func (inst *instance) constructCustomMachineType() string {
@@ -40,11 +40,11 @@ func getDefaultInstanceConfigs() [][]instance {
 	}
 }
 
-func getDefaultInstanceConfigsChan() chan (*instance) {
-	instanceChan := make(chan *instance, 6)
+func getDefaultInstanceConfigsChan() chan (instance) {
+	instanceChan := make(chan instance, 6)
 	for _, instanceRow := range getDefaultInstanceConfigs() {
 		for _, instance := range instanceRow {
-			instanceChan <- &instance
+			instanceChan <- instance
 		}
 	}
 

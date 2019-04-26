@@ -2,5 +2,5 @@ package cmd
 
 const (
 	// MaxContainerCreators The maximum number of workers to create clusters allowed
-	MaxContainerCreators = 2
+	MaxContainerCreators = 1
 )

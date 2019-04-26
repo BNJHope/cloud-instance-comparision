@@ -51,6 +51,7 @@ func runBenchDeploy() {
 		cmd           *exec.Cmd
 		endGroup      sync.WaitGroup
 		instanceMutex = &sync.Mutex{}
+		contextMutex  = &sync.Mutex{}
 	)
 
 	instancesToTry := getDefaultInstanceConfigsChan()
@@ -62,14 +63,16 @@ func runBenchDeploy() {
 			instancesToTry,
 			resultsChan,
 			&endGroup,
-			instanceMutex)
+			instanceMutex,
+			contextMutex)
 	}
 
 	endGroup.Wait()
 	log.Println("Tests finished")
 	close(instancesToTry)
 
-	for res := range resultsChan {
+	for len(resultsChan) > 0 {
+		res := <-resultsChan
 		if res.score > bestScore {
 			bestResult = res
 		}
@@ -78,6 +81,7 @@ func runBenchDeploy() {
 	log.Println("Best score selected")
 	close(resultsChan)
 
+	log.Printf("Best score: %f\n", bestResult.score)
 	log.Printf("Best cores: %d\n", bestResult.inst.cores)
 	log.Printf("Best mem: %d\n", bestResult.inst.mem)
 	log.Printf("Starting instance for image with best attributes.")
@@ -89,17 +93,17 @@ func runBenchDeploy() {
 	}
 	cmd.Wait()
 
-	log.Println("starting pod selected")
+	log.Println("starting pod")
 	if cmd, err = createPod("test-pod", imageLink); err != nil {
 		log.Fatal(err)
 	}
 	cmd.Wait()
 }
 
-func startClusterCreator(workerIndex int, instances chan (*instance), resultChan chan (*result), endGroup *sync.WaitGroup, instanceMutex *sync.Mutex) {
+func startClusterCreator(workerIndex int, instances chan (instance), resultChan chan (*result), endGroup *sync.WaitGroup, instanceMutex *sync.Mutex, contextMutex *sync.Mutex) {
 	defer endGroup.Done()
 	var (
-		instanceToCheck *instance
+		instanceToCheck instance
 		score           float64
 		bestScore       float64
 		bestResult      *result
@@ -113,7 +117,7 @@ func startClusterCreator(workerIndex int, instances chan (*instance), resultChan
 			workerIndex,
 			instanceToCheck.cores,
 			instanceToCheck.mem)
-		score = runMicroBenchmark(workerIndex, instanceToCheck)
+		score = runMicroBenchmark(workerIndex, instanceToCheck, contextMutex)
 		log.Printf("Score %f from worker %d\n",
 			score,
 			workerIndex)
@@ -125,13 +129,14 @@ func startClusterCreator(workerIndex int, instances chan (*instance), resultChan
 	log.Printf("Worker %d finished\n", workerIndex)
 }
 
-func runMicroBenchmark(workerIndex int, inst *instance) float64 {
+func runMicroBenchmark(workerIndex int, inst instance, contextMutex *sync.Mutex) float64 {
 	var (
 		cmd         *exec.Cmd
 		err         error
 		cpuAvg      float64
 		memAvg      float64
 		fullPodName string
+		//context     string
 	)
 
 	machineType := inst.constructCustomMachineType()
@@ -145,25 +150,44 @@ func runMicroBenchmark(workerIndex int, inst *instance) float64 {
 	cmd.Wait()
 
 	log.Printf("Worker %d starting pod\n", workerIndex)
+
+	//contextMutex.Lock()
+	//	if context, err = getContext(machineName); err != nil {
+	//		log.Fatal(err)
+	//	}
+	//
+	//	if cmd, err = setContext(context); err != nil {
+	//		log.Fatal(err)
+	//	}
+	//
+
 	if cmd, err = createPod(podName, imageLink); err != nil {
 		log.Fatal(err)
 	}
+
 	cmd.Wait()
 
 	if fullPodName, err = getFullPodsName(workerIndex); err != nil {
 		log.Fatal(err)
 	}
-	cmd.Wait()
+
+	// contextMutex.Unlock()
 
 	log.Printf("Worker %d getting metrics...\n", workerIndex)
 	time.Sleep(3 * time.Minute)
+
+	// contextMutex.Lock()
+	//if cmd, err = setContext(context); err != nil {
+	//	log.Fatal(err)
+	//}
 
 	if cpuAvg, memAvg, err = getTopAvg(fullPodName); err != nil {
 		log.Fatal(err)
 	}
 
-	log.Printf("Worker %d fetched metrics!\n", workerIndex)
+	//contextMutex.Unlock()
 
+	log.Printf("Worker %d fetched metrics!\n", workerIndex)
 	log.Printf("Worker %d stopping cluster\n", workerIndex)
 	if cmd, err = stopCluster(machineName); err != nil {
 		log.Fatal(err)
@@ -227,27 +251,29 @@ func constructPodName(workerIndex int) string {
 
 func getTopAvg(podName string) (float64, float64, error) {
 	var (
-		output []byte
+		cmd    *exec.Cmd
 		err    error
+		output []byte
 	)
-
-	if output, err = exec.Command("kubectl",
+	cmd = exec.Command("kubectl",
 		"top",
 		"pod",
-		podName).Output(); err != nil {
+		podName)
+
+	if output, err = cmd.Output(); err != nil {
 		return 0, 0, err
 	}
 
 	return parseTopMetrics(output)
 }
 
-func calculateScore(cpuAvg float64, memAvg float64, price float64, inst *instance) float64 {
+func calculateScore(cpuAvg float64, memAvg float64, price float64, inst instance) float64 {
 	if cpuAvg == 0 {
-		cpuAvg += 1
+		cpuAvg++
 	}
 
 	if memAvg == 0 {
-		memAvg += 1
+		memAvg++
 	}
 
 	return cpuAvg * memAvg * float64(inst.cores) * float64(inst.mem) / price
@@ -266,6 +292,35 @@ func createPod(podName string, imageName string) (*exec.Cmd, error) {
 	}
 	return cmd, nil
 
+}
+
+func setContext(context string) (*exec.Cmd, error) {
+	cmd := exec.Command("kubectl",
+		"config",
+		"use-context",
+		context)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return cmd, nil
+}
+
+func getContext(clusterName string) (string, error) {
+	var (
+		context []byte
+		err     error
+	)
+
+	if context, err = exec.Command("kubectl",
+		"config",
+		"get-contexts",
+		"--no-headers").Output(); err != nil {
+		return "", err
+	}
+
+	return parsePodContext(clusterName, context)
 }
 
 func getFullPodsName(workerIndex int) (string, error) {
@@ -317,17 +372,29 @@ func parseTopMetrics(output []byte) (float64, float64, error) {
 }
 
 func parseFullPodName(workerIndex int, output []byte) (string, error) {
-	var (
-		podName string
-	)
 	outputStr := string(output)
 	lines := strings.Split(outputStr, "\n")
-	log.Printf("Printing output for worker %d\n", workerIndex)
-	log.Println(outputStr)
-	for _, l := range lines {
+	for _, l := range lines[0 : len(lines)-1] {
 		name := strings.Fields(l)[1]
+		log.Println(name)
+		log.Println(constructPodName(workerIndex))
 		if strings.Contains(name, constructPodName(workerIndex)) {
-			return podName, nil
+			return name, nil
+		}
+	}
+
+	return "", errors.New("pod not found")
+}
+
+func parsePodContext(clusterName string, output []byte) (string, error) {
+	outputStr := string(output)
+	lines := strings.Split(outputStr, "\n")
+	for _, l := range lines[0 : len(lines)-1] {
+		name := strings.Fields(l)[2]
+		log.Println(name)
+		log.Println(clusterName)
+		if strings.Contains(name, clusterName) {
+			return name, nil
 		}
 	}
 
