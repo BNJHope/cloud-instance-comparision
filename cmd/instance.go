@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"log"
 	"strconv"
 	"strings"
 )
@@ -42,13 +41,9 @@ func getDefaultInstanceConfigs() [][]instance {
 }
 
 func getDefaultInstanceConfigsChan() chan (*instance) {
-	log.Println("Starting chan")
 	instanceChan := make(chan *instance, 6)
-	log.Println("chan made")
 	for _, instanceRow := range getDefaultInstanceConfigs() {
-		log.Println("starting instance row")
 		for _, instance := range instanceRow {
-			log.Println("pushing instance")
 			instanceChan <- &instance
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,17 +21,6 @@ var macroBenchCmd = &cobra.Command{
 	different attributes and deploy the image to the best performing one.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		runBenchDeploy()
-	},
-}
-
-// testInstanceCmd test command for deploying an instance
-var testInstanceCmd = &cobra.Command{
-	Use:   "test-instance",
-	Short: "Start test instance",
-	Long: `Starts the macro benchmarks, involving run the benchmark
-	on the set of all instances to be benchmarked.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		testInstance()
 	},
 }
 
@@ -51,46 +41,6 @@ func init() {
 	rootCmd.AddCommand(macroBenchCmd)
 	macroBenchCmd.Flags().StringVarP(&imageLink, "image", "i", "", "The image to deploy")
 	macroBenchCmd.Flags().IntVarP(&numOfIterations, "iterations", "r", 3, "Number of iterations to carry out")
-
-	rootCmd.AddCommand(testInstanceCmd)
-	testInstanceCmd.Flags().StringVarP(&imageLink, "image", "i", "", "The image to deploy")
-}
-
-func testInstance() {
-	var (
-		err error
-		//cmd         *exec.Cmd
-		fullPodName string
-		cpuAvg      float64
-		memAvg      float64
-	)
-
-	//	machineType := constructCustomMachineType(2)
-	//
-	//	if cmd, err = startCluster("test-cluster", machineType); err != nil {
-	//		log.Fatal(err)
-	//	}
-	//	cmd.Wait()
-
-	//	if cmd, err = createPod("test-pod", imageLink); err != nil {
-	//		log.Fatal(err)
-	//	}
-	//	cmd.Wait()
-	//
-	if fullPodName, err = getFullPodsName(0); err != nil {
-		log.Fatal(err)
-	}
-
-	log.Println(fullPodName)
-	log.Println("waiting 3 mins to get CPU avg")
-	log.Println("getting cpu avg")
-
-	if cpuAvg, memAvg, err = getTopAvg(fullPodName); err != nil {
-		log.Fatal(err)
-	}
-
-	log.Println(cpuAvg)
-	log.Println(memAvg)
 }
 
 func runBenchDeploy() {
@@ -103,13 +53,10 @@ func runBenchDeploy() {
 		instanceMutex = &sync.Mutex{}
 	)
 
-	log.Println("Starting benchdeploy")
 	instancesToTry := getDefaultInstanceConfigsChan()
-	log.Println("Instances fetched")
 	resultsChan := make(chan *result, MaxContainerCreators+1)
 	endGroup.Add(MaxContainerCreators)
 
-	log.Println("Resources created")
 	for i := 0; i < MaxContainerCreators; i++ {
 		go startClusterCreator(i,
 			instancesToTry,
@@ -118,10 +65,8 @@ func runBenchDeploy() {
 			instanceMutex)
 	}
 
-	log.Println("workers created")
-
 	endGroup.Wait()
-	log.Println("endgroup finished")
+	log.Println("Tests finished")
 	close(instancesToTry)
 
 	for res := range resultsChan {
@@ -130,12 +75,12 @@ func runBenchDeploy() {
 		}
 	}
 
-	log.Println("best score selected")
+	log.Println("Best score selected")
 	close(resultsChan)
 
 	log.Printf("Best cores: %d\n", bestResult.inst.cores)
 	log.Printf("Best mem: %d\n", bestResult.inst.mem)
-	log.Printf("Starting instance for image with best containers.")
+	log.Printf("Starting instance for image with best attributes.")
 
 	machineType := bestResult.inst.constructCustomMachineType()
 
@@ -210,16 +155,17 @@ func runMicroBenchmark(workerIndex int, inst *instance) float64 {
 	}
 	cmd.Wait()
 
-	log.Printf("Worker %d sleeping\n", workerIndex)
+	log.Printf("Worker %d getting metrics...\n", workerIndex)
 	time.Sleep(3 * time.Minute)
 
-	log.Printf("Worker %d get avg\n", workerIndex)
 	if cpuAvg, memAvg, err = getTopAvg(fullPodName); err != nil {
 		log.Fatal(err)
 	}
 
+	log.Printf("Worker %d fetched metrics!\n", workerIndex)
+
 	log.Printf("Worker %d stopping cluster\n", workerIndex)
-	if cmd, err = stopCluster("test-cluster"); err != nil {
+	if cmd, err = stopCluster(machineName); err != nil {
 		log.Fatal(err)
 	}
 
@@ -296,6 +242,14 @@ func getTopAvg(podName string) (float64, float64, error) {
 }
 
 func calculateScore(cpuAvg float64, memAvg float64, price float64, inst *instance) float64 {
+	if cpuAvg == 0 {
+		cpuAvg += 1
+	}
+
+	if memAvg == 0 {
+		memAvg += 1
+	}
+
 	return cpuAvg * memAvg * float64(inst.cores) * float64(inst.mem) / price
 }
 
@@ -322,10 +276,11 @@ func getFullPodsName(workerIndex int) (string, error) {
 
 	if output, err = exec.Command("kubectl",
 		"get",
-		"pods").Output(); err != nil {
+		"pods",
+		"--no-headers",
+		"--all-namespaces").Output(); err != nil {
 		return "", err
 	}
-
 	return parseFullPodName(workerIndex, output)
 }
 
@@ -347,8 +302,11 @@ func parseTopMetrics(output []byte) (float64, float64, error) {
 	avgline := lines[1]
 	cpuString := strings.Fields(avgline)[1]
 	memString := strings.Fields(avgline)[2]
-	cpuStringWithoutUnit := strings.TrimSuffix(cpuString, "m")
-	memStringWithoutUnit := strings.TrimSuffix(memString, "%")
+
+	numberMatching := regexp.MustCompile(`[0-9|\.]+`)
+	cpuStringWithoutUnit := string(numberMatching.Find([]byte(cpuString)))
+	memStringWithoutUnit := string(numberMatching.Find([]byte(memString)))
+
 	if cpu, err = strconv.ParseFloat(cpuStringWithoutUnit, 64); err != nil {
 		return 0, 0, err
 	}
@@ -366,7 +324,7 @@ func parseFullPodName(workerIndex int, output []byte) (string, error) {
 	lines := strings.Split(outputStr, "\n")
 	log.Printf("Printing output for worker %d\n", workerIndex)
 	log.Println(outputStr)
-	for _, l := range lines[1:len(lines)] {
+	for _, l := range lines {
 		name := strings.Fields(l)[0]
 		if strings.Contains(name, constructPodName(workerIndex)) {
 			return podName, nil
