@@ -325,7 +325,7 @@ func parseFullPodName(workerIndex int, output []byte) (string, error) {
 	log.Printf("Printing output for worker %d\n", workerIndex)
 	log.Println(outputStr)
 	for _, l := range lines {
-		name := strings.Fields(l)[0]
+		name := strings.Fields(l)[1]
 		if strings.Contains(name, constructPodName(workerIndex)) {
 			return podName, nil
 		}
