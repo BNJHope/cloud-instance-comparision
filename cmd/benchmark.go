@@ -74,6 +74,7 @@ func runBenchDeploy() {
 	for len(resultsChan) > 0 {
 		res := <-resultsChan
 		if res.score > bestScore {
+			bestScore = res.score
 			bestResult = res
 		}
 	}
