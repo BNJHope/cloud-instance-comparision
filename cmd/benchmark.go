@@ -123,6 +123,7 @@ func startClusterCreator(workerIndex int, instances chan (instance), resultChan 
 			score,
 			workerIndex)
 		if score > bestScore {
+			bestScore = score
 			bestResult = &result{score, instanceToCheck}
 		}
 	}
